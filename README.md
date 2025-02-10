@@ -1,3 +1,5 @@
+[![Maven Central](https://maven-badges.herokuapp.com/maven-central/com.github.bjoernq/unmockplugin/badge.svg)](https://maven-badges.herokuapp.com/maven-central/com.github.bjoernq/unmockplugin) [![Apache License](http://img.shields.io/badge/license-Apache%20License%202.0-lightgrey.svg)](http://choosealicense.com/licenses/apache-2.0/)
+
 # Android Unmock Gradle Plugin
 
 ## Purpose
@@ -8,21 +10,21 @@ It tries to solve the problem that you have to mock each and every Android SDK c
 
 ## How to use
 
-Available on jcenter: [ ![Download](https://api.bintray.com/packages/bjoernq/maven/de.mobilej.unmock/images/download.svg) ](https://bintray.com/bjoernq/maven/de.mobilej.unmock/_latestVersion)
-
-Add the plugin to your buildscript dependencies and make sure to use the jcenter repository:
+Add the plugin to your buildscript dependencies and make sure to use the maven central repository:
 
 ```groovy
 buildscript {
     repositories {
-        jcenter()
+        mavenCentral()
     }
     
     dependencies {
-        classpath 'de.mobilej.unmock:UnMockPlugin:0.3.6'
+        classpath "com.github.bjoernq:unmockplugin:${unmockpluginVersion}"
     }
 }
 ```
+
+Please note: Versions prior to 0.7.6 are not available on Maven Central.
 
 And this to the module's build script:
 
@@ -34,9 +36,6 @@ Additionally you have to configure which classes to use and where to get the rea
 
 ```groovy
 unMock {
-    // URI to download the android-all.jar from. e.g. https://oss.sonatype.org/content/groups/public/org/robolectric/android-all/
-    downloadFrom 'https://oss.sonatype.org/content/groups/public/org/robolectric/android-all/4.3_r2-robolectric-0/android-all-4.3_r2-robolectric-0.jar'
-
     keep "android.widget.BaseAdapter"
     keep "android.widget.ArrayAdapter"
     keep "android.os.Bundle"
@@ -63,24 +62,30 @@ unMock {
 
     keepAndRename "java.nio.charset.Charsets" to "xjava.nio.charset.Charsets"
 }
+
+dependencies {
+    // dependency to android-all to use
+    unmock 'org.robolectric:android-all:4.3_r2-robolectric-0'
+}
+
 ```
 
 |Statement|Description|
 |-------|-----------|
-|downloadFrom|here you configure the url to download the android-all.jar from, optionally you can specify a directory to download the file to (e.g. to '<directory>') - the default is the tmpdir|
 |keep|keeps the specified class (and it's possibly present inner classes)|
 |keepStartingWith|keeps every class which FQN starts with the given string|
 |keepAndRename|let you keep a class while renaming it (e.g. needed for classes in the "java" top-level package since these are only allowed to be loaded from the boot classpath)|
+|delegateClass|every method (and constructor) in the given class is delegated to de.mobilej.ABridge. Makes it easier to mock things in a framework class you inherit from|
 
-That's it. I use the android-all.jar from the Robolectric project for convenience.
+That's it!
 
 Have a look at the example contained in this repository for more details.
 
 Starting from version 0.3.5 you can leave out the configuration closure which will result using defaults (which are shown in the example above).
 
-downloadFrom is now optional. If not given it will use 'https://oss.sonatype.org/content/groups/public/org/robolectric/android-all/4.3_r2-robolectric-0/android-all-4.3_r2-robolectric-0.jar'
-
 If you use any of the keep statements the default configuration will be cleared. (So your own configuration is not adding but replaces the default).
+
+If you don't configure the unmock dependency the plugin will use `org.robolectric:android-all:4.3_r2-robolectric-0`
 
 ## Versions
 
@@ -97,11 +102,32 @@ If you use any of the keep statements the default configuration will be cleared.
 |0.3.3|Android Gradle Plugin 1.3.0 compatibility|
 |0.3.5|Use default config if no configuration closure is given|
 |0.3.6|Optionally you can specify a directory to download the all-android.jar to|
+|0.4.0|Support for "delegateClass" added|
+|0.5.0|ABridge now includes callByte, callDouble and callFloat, this _might_ break tests that rely on ABrdige.callObject to be called in these cases|
+|0.5.1|Unique names for unmocked-android.jar to workaround an Android Studio problem|
+|0.6.0|Use Gradle's dependency management to get the android-all.jar, more magic to workaround issues using unmocked Android-6.0+ classes|
+|0.6.1|Make it work with Gradle 4.0-milestone and Android Gradle plugin to 3.0.0.-alpha1 while keep it working on previous versions|
+|0.6.2|Make it work with activated Kotlin plugin|
+|0.6.3|Make it possible to use Gradle 4 with Android Gradle plugin < 3.0|
+|0.6.4|Works with kapt3|
+|0.6.5|Also copy non-class files when they are matched by keepStartingWith|
+|0.7.0|Using downloadFrom will make your build fail - use unmock scoped dependency now|
+|0.7.1|Add support for proper Gradle up-to-date checks (thanks to @drewhannay)|
+|0.7.2|Enable relocatable Gradle build cache support (thanks to @drewhannay)|
+|0.7.3|Several internal improvements (PR 52, 53) contributed by  @drewhannay and @stephanenicolas|
+|0.7.4|Bump Javassist version
+|0.7.5|Allow unmocked classes in any variant (PR 62)
+|0.7.6|Bump Javassist version to 3.27.0-GA
+|0.7.7| ---
+|0.7.8|Gradle 7.0 compatability, contributed by @calvarez-ov
+|0.7.9|Fix #77, contributed by @matejdro
+|0.8.0|#83, contributed by @matejdro
+|0.9.0|#69
 
 ## License
 
 ```
-Copyright 2015 Björn Quentin
+Copyright 2015-2024 Björn Quentin
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

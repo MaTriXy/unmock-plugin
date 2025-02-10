@@ -16,17 +16,18 @@
 
 package de.mobilej;
 
-import org.gradle.api.logging.Logger;
-
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.net.URL;
-import java.nio.channels.Channels;
-import java.nio.channels.ReadableByteChannel;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Enumeration;
@@ -40,42 +41,37 @@ import java.util.zip.ZipOutputStream;
 import javassist.CannotCompileException;
 import javassist.ClassPool;
 import javassist.CtClass;
+import javassist.CtConstructor;
 import javassist.CtMethod;
 import javassist.Modifier;
+import javassist.NotFoundException;
+import javassist.expr.ExprEditor;
+import javassist.expr.MethodCall;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Here the heavy lifting happens.
- * <p/>
+ *
  * We take the all-android.jar and copy the wanted classes to the destination.
- * <p/>
+ *
  * The copied classes will be non-final/non-private and also all methods contained.
- * <p/>
+ *
  * Additionally all native methods will be changed to delegate to de.mobilej.ABridge.callXXX methods
  * for easier mocking.
  */
 public class ProcessRealAndroidJar {
 
 
-    public static boolean isUpToDate(String allAndroidSourceUrl, String downloadTo, String[] keepClasses, String[] renameClasses, String destFile,
-                                     String intermediatesDir, File buildFile, Logger logger)
-            throws Exception {
+    private static final Logger log = LoggerFactory.getLogger(ProcessRealAndroidJar.class);
 
-        final File intermediates = new File(intermediatesDir);
-        File out = new File(intermediates, "unmock_work");
-        if (out.exists() && buildFile.lastModified() < out.lastModified()) {
-            return true;
-        }
-
-        return false;
-    }
-
-    public static void process(String allAndroidSourceUrl, String downloadTo, String[] keepClasses, String[] renameClasses, String destFile,
-                               String intermediatesDir, File buildFile, Logger logger)
-            throws Exception {
-
-        if (allAndroidSourceUrl == null) {
-            throw new IllegalArgumentException("No URL specified to download the full Android jar.");
-        }
+    public static void process(File allAndroidFile,
+                               File tmpDir,
+                               File unmockedOutputJar,
+                               String[] keepClasses,
+                               String[] renameClasses,
+                               String[] delegateClasses,
+                               Logger logger) throws Exception {
 
         List<ClassMapping> classesToMap = parseClassesToMap(renameClasses, logger);
 
@@ -83,32 +79,10 @@ public class ProcessRealAndroidJar {
         for (ClassMapping mapping : classesToMap) {
             keepClassesList.add(mapping.from);
         }
-        keepClasses = keepClassesList.toArray(new String[keepClassesList.size()]);
+        keepClasses = keepClassesList.toArray(new String[0]);
 
-        // DOWNLOAD the wished version
-        // e.g. from https://oss.sonatype.org/content/groups/public/org/robolectric/android-all/
-        // e.g.:
-        // https://oss.sonatype.org/content/groups/public/org/robolectric/android-all/5.0.0_r2-robolectric-0/android-all-5.0.0_r2-robolectric-0.jar
-
-        final File intermediates = new File(intermediatesDir);
-        final File tmpDir = new File(downloadTo == null ? System.getProperty("java.io.tmpdir") : downloadTo);
-        File allAndroidFile = new File(tmpDir,
-                allAndroidSourceUrl.replace("/", "_").replace(":", "_"));
-
-        if (!allAndroidFile.exists()) {
-            URL website = new URL(allAndroidSourceUrl);
-            ReadableByteChannel rbc = Channels.newChannel(website.openStream());
-            FileOutputStream fos = new FileOutputStream(allAndroidFile);
-            fos.getChannel().transferFrom(rbc, 0, Long.MAX_VALUE);
-        }
-
-        File out = new File(intermediates, "unmock_work");
-        if (out.exists() && buildFile.lastModified() < out.lastModified()) {
-            return;
-        }
-
-        delete(out);
-        out.mkdirs();
+        delete(tmpDir);
+        tmpDir.mkdirs();
 
         ArrayList<String> clazzNames = findAllClazzesIn(
                 allAndroidFile.getAbsolutePath());
@@ -118,7 +92,9 @@ public class ProcessRealAndroidJar {
 
         pool.insertClassPath(allAndroidFile.getAbsolutePath());
 
-        createHelperClasses(out, pool);
+        createHelperClasses(tmpDir, pool);
+
+        List<CtClass> clazzes = new ArrayList<>();
 
         for (String clazzName : clazzNames) {
             CtClass clazz = pool.get(clazzName);
@@ -144,21 +120,56 @@ public class ProcessRealAndroidJar {
                 }
             }
 
-            if (!keep) {
+            boolean delegate = false;
+            for (String delegateClazzName : delegateClasses) {
+                if (clazz.getName().equals(delegateClazzName)) {
+                    delegate = true;
+                    break;
+                } else if (clazz.getName().startsWith(delegateClazzName + "$")) {
+                    delegate = true;
+                    break;
+                }
+            }
+
+            if (!keep && !delegate) {
                 continue;
             }
 
             try {
-                process(clazz, classesToMap);
+                if (keep) {
+                    process(clazz, classesToMap);
+                } else if (delegate) {
+                    processDelegate(clazz, classesToMap);
+                }
             } catch (Exception e) {
                 logger.error("-> unable to process", e);
             }
 
-            clazz.writeFile(out.getAbsolutePath());
+            clazzes.add(clazz);
         }
 
-        createJarArchive(destFile,
-                out.getAbsolutePath());
+        // Write the files after all CtClass objects have been modified, otherwise Javassist
+        // doesn't allow modifying a nested class when the outer class has been written already
+        // (it freezes the outer class again).
+        for (CtClass clazz : clazzes) {
+            clazz.writeFile(tmpDir.getAbsolutePath());
+        }
+
+        // copy over non-classes matching "keepStartsWith" paths
+        ArrayList<String> toCopy = new ArrayList<>();
+        ArrayList<String> nonClasses = findAllNonClassFilesIn(allAndroidFile.getAbsolutePath());
+        for (String keep : keepClasses) {
+            if (!keep.startsWith("-")) {
+                for (String file : nonClasses) {
+                    if (file.startsWith(keep.replace(".", "/"))) {
+                        toCopy.add(file);
+                    }
+                }
+            }
+        }
+        copyFromJarToDirectory(allAndroidFile.getAbsolutePath(), toCopy, tmpDir.getAbsoluteFile());
+
+        createJarArchive(unmockedOutputJar.getAbsolutePath(), tmpDir.getAbsolutePath());
 
     }
 
@@ -261,6 +272,21 @@ public class ProcessRealAndroidJar {
                         "}", bridge));
 
         bridge.addMethod(CtMethod.make(
+                "public static byte callByte(String signature, Object thiz, Object[] args){" +
+                        "return 0;" +
+                        "}", bridge));
+
+        bridge.addMethod(CtMethod.make(
+                "public static float callFloat(String signature, Object thiz, Object[] args){" +
+                        "return 0f;" +
+                        "}", bridge));
+
+        bridge.addMethod(CtMethod.make(
+                "public static double callDouble(String signature, Object thiz, Object[] args){" +
+                        "return 0d;" +
+                        "}", bridge));
+
+        bridge.addMethod(CtMethod.make(
                 "public static void callVoid(String signature, Object thiz, Object[] args){" +
                         "return;" +
                         "}", bridge));
@@ -284,6 +310,132 @@ public class ProcessRealAndroidJar {
         return res;
     }
 
+    private static ArrayList<String> findAllNonClassFilesIn(String file) throws IOException {
+        ArrayList<String> res = new ArrayList<String>();
+
+        ZipFile f = new ZipFile(file);
+        Enumeration<? extends ZipEntry> entries = f.entries();
+        while (entries.hasMoreElements()) {
+            ZipEntry entry = entries.nextElement();
+            if (!entry.isDirectory() && !entry.getName().endsWith(".class")) {
+                res.add(entry.getName());
+            }
+
+        }
+
+        return res;
+    }
+
+    private static void copyFromJarToDirectory(String file, List<String> files, File destDir) throws IOException {
+        try (FileSystem fileSystem = FileSystems.newFileSystem(Paths.get(file), (ClassLoader) null)) {
+            for (String toCopy : files) {
+                Path source = fileSystem.getPath(toCopy);
+                File dst = new File(destDir, toCopy);
+                dst.getParentFile().mkdirs();
+                Files.copy(source, dst.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
+
+    private static void processDelegate(CtClass clazz, List<ClassMapping> classMappings) throws Exception {
+        if (clazz.isInterface()) {
+            return;
+        }
+
+        clazz.defrost();
+
+        clazz.setModifiers(clazz.getModifiers() | Modifier.PUBLIC);
+        clazz.setModifiers(clazz.getModifiers() & ~Modifier.FINAL);
+        clazz.setModifiers(clazz.getModifiers() & ~Modifier.PRIVATE);
+        clazz.setModifiers(clazz.getModifiers() & ~Modifier.PROTECTED);
+
+        CtMethod[] methods = clazz.getDeclaredMethods();
+        for (CtMethod m : methods) {
+            // we delegate every method here
+            delegateMethod(m);
+
+
+            m.setModifiers(m.getModifiers() | Modifier.PUBLIC);
+            m.setModifiers(m.getModifiers() & ~Modifier.FINAL);
+            m.setModifiers(m.getModifiers() & ~Modifier.PRIVATE);
+            m.setModifiers(m.getModifiers() & ~Modifier.PROTECTED);
+            m.setModifiers(m.getModifiers() & ~Modifier.NATIVE);
+        }
+
+        CtConstructor[] ctors = clazz.getDeclaredConstructors();
+        for (CtConstructor c : ctors) {
+            // we also delegate every ctor here
+            String signature = c.getLongName();
+            String thiz = "$0";
+
+            c.setBody("{ de.mobilej.ABridge.callVoid(\"" + signature + "\", " + thiz
+                    + ", $args); } ");
+
+            c.setModifiers(c.getModifiers() | Modifier.PUBLIC);
+            c.setModifiers(c.getModifiers() & ~Modifier.FINAL);
+            c.setModifiers(c.getModifiers() & ~Modifier.PRIVATE);
+            c.setModifiers(c.getModifiers() & ~Modifier.PROTECTED);
+            c.setModifiers(c.getModifiers() & ~Modifier.NATIVE);
+        }
+
+        for (ClassMapping mapping : classMappings) {
+            clazz.replaceClassName(mapping.from, mapping.to);
+        }
+    }
+
+    private static void delegateMethod(CtMethod m) throws NotFoundException, CannotCompileException {
+        String signature = m.getLongName();
+        String thiz = "$0";
+        if ((m.getModifiers() & Modifier.STATIC) == Modifier.STATIC) {
+            thiz = "null";
+        }
+
+        String retType = m.getReturnType().getName();
+
+        switch (retType) {
+            case "void":
+                m.setBody("{ de.mobilej.ABridge.callVoid(\"" + signature + "\", " + thiz
+                        + ", $args); } ");
+                break;
+            case "boolean":
+                m.setBody(
+                        "{ return de.mobilej.ABridge.callBoolean(\"" + signature + "\", "
+                                + thiz
+                                + ", $args); } ");
+                break;
+            case "int":
+                m.setBody(
+                        "{ return de.mobilej.ABridge.callInt(\"" + signature + "\", " + thiz
+                                + ", $args); } ");
+                break;
+            case "long":
+                m.setBody("{ return de.mobilej.ABridge.callLong(\"" + signature + "\", "
+                        + thiz
+                        + ", $args); } ");
+                break;
+            case "byte":
+                m.setBody("{ return de.mobilej.ABridge.callByte(\"" + signature + "\", "
+                        + thiz
+                        + ", $args); } ");
+                break;
+            case "float":
+                m.setBody("{ return de.mobilej.ABridge.callFloat(\"" + signature + "\", "
+                        + thiz
+                        + ", $args); } ");
+                break;
+            case "double":
+                m.setBody("{ return de.mobilej.ABridge.callDouble(\"" + signature + "\", "
+                        + thiz
+                        + ", $args); } ");
+                break;
+            default:
+                m.setBody(
+                        "{ return ($r)de.mobilej.ABridge.callObject(\"" + signature + "\","
+                                + thiz + ", $args); } ");
+                break;
+        }
+    }
+
     private static void process(CtClass clazz, List<ClassMapping> classMappings) throws Exception {
 
         if (clazz.isInterface()) {
@@ -304,41 +456,9 @@ public class ProcessRealAndroidJar {
             // we change native to normal method but need to
             // delegate
             if ((m.getModifiers() & Modifier.NATIVE) == Modifier.NATIVE) {
-                String signature = m.getLongName();
-                String thiz = "$0";
-                if ((m.getModifiers() & Modifier.STATIC) == Modifier.STATIC) {
-                    thiz = "null";
-                }
-
-                String retType = m.getReturnType().getName();
-
-                switch (retType) {
-                    case "void":
-                        m.setBody("{ de.mobilej.ABridge.callVoid(\"" + signature + "\", " + thiz
-                                + ", $args); } ");
-                        break;
-                    case "boolean":
-                        m.setBody(
-                                "{ return de.mobilej.ABridge.callBoolean(\"" + signature + "\", "
-                                        + thiz
-                                        + ", $args); } ");
-                        break;
-                    case "int":
-                        m.setBody(
-                                "{ return de.mobilej.ABridge.callInt(\"" + signature + "\", " + thiz
-                                        + ", $args); } ");
-                        break;
-                    case "long":
-                        m.setBody("{ return de.mobilej.ABridge.callLong(\"" + signature + "\", "
-                                + thiz
-                                + ", $args); } ");
-                        break;
-                    default:
-                        m.setBody(
-                                "{ return ($r)de.mobilej.ABridge.callObject(\"" + signature + "\","
-                                        + thiz + ", $args); } ");
-                        break;
-                }
+                delegateMethod(m);
+            } else {
+                instumentMethod(m);
             }
 
             m.setModifiers(m.getModifiers() | Modifier.PUBLIC);
@@ -353,6 +473,21 @@ public class ProcessRealAndroidJar {
         for (ClassMapping mapping : classMappings) {
             clazz.replaceClassName(mapping.from, mapping.to);
         }
+    }
+
+    private static void instumentMethod(CtMethod m) throws CannotCompileException {
+        m.instrument(new ExprEditor() {
+            public void edit(MethodCall m) throws CannotCompileException {
+                // special handling for System.arrraycopy and VMRuntime
+                if (m.getClassName().equals("java.lang.System") && m.getMethodName().equals("arraycopy")) {
+                    m.replace("{java.lang.System.arraycopy($1,$2,$3,$4,$5);}");
+                } else if (m.getClassName().equals("dalvik.system.VMRuntime") && m.getMethodName().equals("newUnpaddedArray")) {
+                    m.replace("{$_ = java.lang.reflect.Array.newInstance($1,$2);}");
+                } else if (m.getClassName().equals("dalvik.system.VMRuntime") && m.getMethodName().equals("getRuntime")) {
+                    m.replace("{$_ = null;}");
+                }
+            }
+        });
     }
 
     public static boolean delete(File file) {

@@ -16,63 +16,65 @@
 
 package de.mobilej.unmock
 
-import de.mobilej.ProcessRealAndroidJar
+import com.android.build.gradle.api.BaseVariant
+import de.mobilej.UnMockTransform
+import org.gradle.api.DomainObjectSet
 import org.gradle.api.Plugin
 import org.gradle.api.Project
+import org.gradle.api.attributes.Attribute
 
 class UnMockPlugin implements Plugin<Project> {
-
     void apply(Project project) {
+        def unmockProcessedAttribute = Attribute.of("unmockProcessed", Boolean.class)
 
-        try {
-            project.dependencies.
-                    add("testCompile",
-                            project.files("$project.buildDir/intermediates/unmocked-android.jar"))
-        } catch (Exception e) {
-            project.logger.warn("Make sure to use Android Gradle plugin version 1.1.0 (or newer)")
-            return
-        }
+        def unmockConfiguration = project.configurations.create("unmock")
+        def unMockExt = project.extensions.create("unMock", UnMockExtension)
 
-        project.extensions.create("unMock", UnMockExtension)
-
-        project.task('unMock') {
-
-            outputs.upToDateWhen {
-                return ProcessRealAndroidJar.isUpToDate(
-                        project.unMock.allAndroid,
-                        project.unMock.downloadTo,
-                        project.unMock.keep.toArray(new String[project.unMock.keep.size()]),
-                        project.unMock.rename.toArray(new String[project.unMock.rename.size()]),
-                        "$project.buildDir/intermediates/unmocked-android.jar",
-                        "$project.buildDir/intermediates/",
-                        project.buildFile,
-                        project.logger)
+        project.dependencies {
+            attributesSchema {
+                attribute(unmockProcessedAttribute)
             }
 
-            doLast {
-                ProcessRealAndroidJar.process(
-                        project.unMock.allAndroid,
-                        project.unMock.downloadTo,
-                        project.unMock.keep.toArray(new String[project.unMock.keep.size()]),
-                        project.unMock.rename.toArray(new String[project.unMock.rename.size()]),
-                        "$project.buildDir/intermediates/unmocked-android.jar",
-                        "$project.buildDir/intermediates/",
-                        project.buildFile,
-                        project.logger)
+            if (artifactTypes.getNames().contains("jar")) {
+                artifactTypes.getByName("jar") {
+                    attributes.attribute(unmockProcessedAttribute, false)
+                }
             }
 
+            registerTransform(UnMockTransform) {
+                from.attribute(unmockProcessedAttribute, false)
+                to.attribute(unmockProcessedAttribute, true)
+
+                parameters {
+                    tmpDir = project.file("${project.buildDir}/intermediates/unmock_work")
+                    keepClasses = unMockExt.keep
+                    renameClasses = unMockExt.rename
+                    delegateClasses = unMockExt.delegateClasses
+                }
+            }
         }
 
         project.afterEvaluate {
-            project.tasks.each {
-                task ->
-                    if (task.name ==~ /compile.*UnitTestJava.*/) {
-                        task.dependsOn('unMock')
-                    }
-            }
+            unmockConfiguration.attributes.attribute(unmockProcessedAttribute, true)
         }
 
 
+        //create a unique configuration with a default dependency to android jar
+        unmockConfiguration.defaultDependencies { dependencies ->
+            // If the user doesn't add any dependencies to the unmock configuration, this will be used
+            dependencies.add(project.dependencies.create("org.robolectric:android-all:4.3_r2-robolectric-0"))
+        }
+
+        def isLib = project.plugins.findPlugin('com.android.library')
+        def isApp = project.plugins.findPlugin('com.android.application')
+
+        // Use custom variants if specified, otherwise fallback to just unit tests for apps and libs
+        project.afterEvaluate {
+            def mainVariants = unMockExt.variants ?: (isLib || isApp ? project.android.unitTestVariants : null)
+            mainVariants?.configureEach { variant ->
+                variant.registerPreJavacGeneratedBytecode(unmockConfiguration)
+            }
+        }
     }
 }
 
@@ -82,15 +84,17 @@ class UnMockExtension {
 
     String downloadTo
 
-    ArrayList<String> keep = new ArrayList<>()
+    List<String> keep = new ArrayList<>()
 
-    ArrayList<String> rename = new ArrayList<>()
+    List<String> rename = new ArrayList<>()
+
+    List<String> delegateClasses = new ArrayList<>()
 
     boolean usingDefaults = false
 
-    public UnMockExtension() {
-        downloadFrom 'https://oss.sonatype.org/content/groups/public/org/robolectric/android-all/4.3_r2-robolectric-0/android-all-4.3_r2-robolectric-0.jar'
+    DomainObjectSet<BaseVariant> variants
 
+    public UnMockExtension() {
         keep "android.widget.BaseAdapter"
         keep "android.widget.ArrayAdapter"
         keep "android.os.Bundle"
@@ -130,10 +134,18 @@ class UnMockExtension {
         keep.add("-" + clazz)
     }
 
+    void delegateClass(final String clazz) {
+        clearDefaultIfNecessary()
+        delegateClasses.add(clazz)
+    }
 
     void keepStartingWith(final String clazz) {
         clearDefaultIfNecessary()
         keep.add(clazz)
+    }
+
+    void includeInVariants(final DomainObjectSet<BaseVariant> customVariants) {
+        this.variants = customVariants
     }
 
     KeepMapping keepAndRename(final String clazzToKeep) {
